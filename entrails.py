@@ -85,6 +85,15 @@ logger = logging.getLogger('envidat_tool')
 
 # ----- Helpers for XML parsing (remove namespace, robust find) -----
 
+# - need to show human readable byte amount (why can i never do this in my head?)
+def human_bytes(n):
+    n = int(n)
+    for unit in ['B','KiB','MiB','GiB','TiB','PiB']:
+        if abs(n) < 1024.0:
+            return f'{n:3.1f}{unit}'
+        n /= 1024.0
+    return f'{n:.1f}EiB'
+
 def _strip_s3_xml_namespace(xml_text: str) -> str:
     """Remove the s3 xmlns attribute to simplify ElementTree parsing.
 
@@ -315,7 +324,8 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
     sunburst_fig.write_html(sunburst_out)
     logger.info('Sunburst written to %s', sunburst_out)
 
-    # ---------- Sankey chart: Total -> extension ----------
+
+# ---------- Sankey chart: Total -> extension ----------
     total_by_extension = df.groupby('extension').size().reset_index(name='count').sort_values('count', ascending=False)
 
     labels = ['Total files'] + total_by_extension['extension'].tolist()
@@ -338,6 +348,102 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
     logger.info('Sankey written to %s', sankey_out)
 
     logger.info('Visualization complete.')
+
+    # ---------- Sankey chart: Total bytes -> extension ----------
+    # Ensure size column is numeric (coerce errors to 0) and use int64 for large sums
+    df['size_bytes'] = pd.to_numeric(df.get('size', df.get('size_bytes', None)), errors='coerce').fillna(0).astype('int64')
+
+    # Aggregate total bytes per extension
+    total_by_extension_bytes = (
+        df.groupby('extension', as_index=False)['size_bytes']
+          .sum()
+          .sort_values('size_bytes', ascending=False)
+    )
+
+    # Build Sankey labels and links: Total bytes -> extension
+    labels_bytes = ['Total bytes'] + total_by_extension_bytes['extension'].tolist()
+    source = []
+    target = []
+    value = []
+
+    for i, row in enumerate(total_by_extension_bytes.itertuples(index=False)):
+        source.append(0)           # from 'Total bytes' node
+        target.append(1 + i)      # to each extension node
+        value.append(int(row.size_bytes))
+
+    sankey_bytes_fig = go.Figure(go.Sankey(
+        node=dict(label=labels_bytes, pad=15, thickness=20),
+        link=dict(source=source, target=target, value=value)
+    ))
+    sankey_bytes_fig.update_layout(
+        title=f'File type breakdown by total bytes (Total -> extension) — total bytes = {int(df["size_bytes"].sum()):,}'
+    )
+    sankey_bytes_out = f"{out_prefix}_sankey_size.html"
+    sankey_bytes_fig.write_html(sankey_bytes_out)
+    logger.info('Sankey (by bytes) written to %s', sankey_bytes_out)
+
+    # ---------- Sunburst chart: bucket -> extension (wedge sizes = total bytes) ----------
+    # Group by (bucket_name, extension) and sum bytes
+    df_counts_bytes = (
+        df.groupby(['bucket_name', 'extension'], as_index=False)['size_bytes']
+          .sum()
+    )
+
+    # Coerce types to safe Python int / str
+    df_counts_bytes = pd.DataFrame(df_counts_bytes)
+    df_counts_bytes['size_bytes'] = df_counts_bytes['size_bytes'].astype('int64')
+    df_counts_bytes['bucket_name'] = df_counts_bytes['bucket_name'].astype(str)
+    df_counts_bytes['extension'] = df_counts_bytes['extension'].astype(str)
+
+    # Build hierarchical ids, labels, parents, and values for sunburst (root -> bucket -> extension)
+    labels = []
+    ids = []
+    parents = []
+    values = []
+
+    # root node
+    ids.append('root')
+    labels.append('All bytes')
+    parents.append('')
+    values.append(int(df_counts_bytes['size_bytes'].sum()))
+
+    # bucket nodes (one per bucket)
+    buckets_bytes = df_counts_bytes.groupby('bucket_name', as_index=False)['size_bytes'].sum()
+    for row in buckets_bytes.itertuples(index=False):
+        bid = f"bucket:{row.bucket_name}"
+        ids.append(bid)
+        labels.append(str(row.bucket_name))
+        parents.append('root')
+        values.append(int(row.size_bytes))
+
+    # extension nodes under each bucket
+    for row in df_counts_bytes.itertuples(index=False):
+        bid = f"bucket:{row.bucket_name}"
+        eid = f"{row.bucket_name}|{row.extension}"
+        ids.append(eid)
+        labels.append(str(row.extension))
+        parents.append(bid)
+        values.append(int(row.size_bytes))
+
+    # Create sunburst. Add a hovertemplate to show bytes with thousands separators.
+    sunburst_bytes_fig = go.Figure(go.Sunburst(
+        ids=ids,
+        labels=labels,
+        parents=parents,
+        values=values,
+        branchvalues='total',
+        hovertemplate='%{label}<br>Bytes: %{value:,}<extra></extra>'
+    ))
+    sunburst_bytes_fig.update_layout(
+        title=f'File types by bucket (sunburst) — bytes as wedge size (total = {int(df_counts_bytes["size_bytes"].sum()):,})'
+    )
+    sunburst_bytes_out = f"{out_prefix}_sunburst_size.html"
+    sunburst_bytes_fig.write_html(sunburst_bytes_out)
+    logger.info('Sunburst (by bytes) written to %s', sunburst_bytes_out)
+
+
+
+
 
 
 # ----- CLI wiring -----
