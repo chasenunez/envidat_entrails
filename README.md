@@ -5,14 +5,14 @@ This toolkit does three main things:
 
 1. **Downloads metadata listings** from several S3-compatible endpoints.  
 2. **Aggregates file details** (like name, extension, and size) into a unified CSV (`all_s3_files.csv`).  
-3. **Visualizes the results** with snazzy, interactive charts using Plotly.
+3. **Visualizes the results** with interactive charts using Plotly.
 
 You’ll get:
 - Sankey diagrams for file-type distributions (by count *and* by size)
 - Sunburst charts showing bucket and extension hierarchies (also by count *and* by size)
 - A CSV summary for further analysis
 
-## The Buckets (as of now)
+## The Buckets (can be added to later)
 
 These are the five S3 endpoints we’re working with:
 
@@ -95,5 +95,3 @@ Because nobody wants to count bytes manually.
 ## License
 
 MIT License — use, remix, or extend freely.
-Attribution appreciated, but not required.
-If you fix bugs, buy yourself a coffee ☕ — you’ve earned it.
