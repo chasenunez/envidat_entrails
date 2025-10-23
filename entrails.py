@@ -266,9 +266,51 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
         df_counts.loc[~df_counts['extension'].isin(top_exts), 'extension'] = '<other>'
         df_counts = df_counts.groupby(['bucket_name', 'extension'], as_index=False)['count'].sum()
 
-    # ---------- Sunburst chart: bucket -> extension ----------
-    sunburst_path = ['bucket_name', 'extension']
-    sunburst_fig = px.sunburst(df_counts, path=sunburst_path, values='count', title='File types by bucket (sunburst)')
+    # ---------- Sunburst chart: bucket -> extension (use graph_objects to avoid narwhals/px backend issues) ----------
+    # Ensure df_counts is a plain pandas DataFrame and correct dtypes
+    df_counts = pd.DataFrame(df_counts)
+    df_counts['count'] = df_counts['count'].astype(int)
+    df_counts['bucket_name'] = df_counts['bucket_name'].astype(str)
+    df_counts['extension'] = df_counts['extension'].astype(str)
+
+    # Build hierarchical ids, labels, parents, and values for sunburst (root -> bucket -> extension)
+    labels = []
+    ids = []
+    parents = []
+    values = []
+
+    # root node
+    ids.append('root')
+    labels.append('All files')
+    parents.append('')
+    values.append(int(df_counts['count'].sum()))
+
+    # bucket nodes (one per bucket)
+    buckets = df_counts.groupby('bucket_name', as_index=False)['count'].sum()
+    for row in buckets.itertuples(index=False):
+        bid = f"bucket:{row.bucket_name}"
+        ids.append(bid)
+        labels.append(str(row.bucket_name))
+        parents.append('root')
+        values.append(int(row.count))
+
+    # extension nodes under each bucket
+    for row in df_counts.itertuples(index=False):
+        bid = f"bucket:{row.bucket_name}"
+        eid = f"{row.bucket_name}|{row.extension}"
+        ids.append(eid)
+        labels.append(str(row.extension))
+        parents.append(bid)
+        values.append(int(row.count))
+
+    sunburst_fig = go.Figure(go.Sunburst(
+        ids=ids,
+        labels=labels,
+        parents=parents,
+        values=values,
+        branchvalues='total'
+    ))
+    sunburst_fig.update_layout(title='File types by bucket (sunburst)')
     sunburst_out = f"{out_prefix}_sunburst.html"
     sunburst_fig.write_html(sunburst_out)
     logger.info('Sunburst written to %s', sunburst_out)
