@@ -12,7 +12,7 @@ You’ll get:
 - Sunburst charts showing bucket and extension hierarchies (also by count *and* by size)
 - A CSV summary for further analysis
 
-## The Buckets (can be added to later)
+## Buckets Analyzed
 
 These are the five S3 endpoints we’re working with:
 
