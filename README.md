@@ -23,6 +23,7 @@ These are the five S3 endpoints we’re working with:
 | `chelsav1` | CHELSA climate dataset (v1) |
 | `chelsav2` | CHELSA climate dataset (v2) |
 | `edna` | Elevation-derived hydrological data |
+| `others` | We can add other S3 buckets later |
 
 Each bucket is public on the SWITCH Cloud (`https://os.zhdk.cloud.switch.ch/<bucket-name>/`).
 
