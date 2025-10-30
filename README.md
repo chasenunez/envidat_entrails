@@ -1,7 +1,7 @@
 
 # EnviDat Entrails for Exploring & Visualizing the data types on Envidat
 
-This toolkit does three main things:
+This script does three main things:
 
 1. **Downloads metadata listings** from several S3-compatible endpoints.  
 2. **Aggregates file details** (like name, extension, and size) into a unified CSV (`all_s3_files.csv`).  
