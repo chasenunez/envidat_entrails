@@ -1,19 +1,19 @@
-# EnviDat Entrails for Exploring & Visualizing the data types on Envidat
+# Entrails Fetches & Visualizes the data types in an S3 Bucket
 
 This script does three main things:
 
-1. **Downloads metadata listings** from several S3-compatible endpoints.  
+1. **Downloads metadata listings** from several S3-compatible endpoints (including zip files) 
 2. **Aggregates file details** (like name, extension, and size) into a unified CSV (`all_s3_files.csv`).  
 3. **Visualizes the results** with interactive charts using Plotly.
 
-You’ll get:
+What pops out:
 - Sankey diagrams for file-type distributions (by count *and* by size)
 - Sunburst charts showing bucket and extension hierarchies (also by count *and* by size)
 - A CSV summary for further analysis
 
 ## Buckets Analyzed
 
-These are the five S3 endpoints we’re working with:
+For [Envidat](https://www.envidat.ch/#/), These are the five S3 endpoints we’re working with:
 
 | Bucket | Description |
 |--------|--------------|
@@ -169,17 +169,6 @@ print(human_bytes(34782943827))  # 32.4GiB
 ```
 
 Because nobody wants to count bytes manually.
-
-## Troubleshooting
-
-**Q:** “I got an Access Denied error.”
-**A:** Some buckets or objects might be private. The script skips those gracefully.
-
-**Q:** “My sunburst looks weird.”
-**A:** Make sure the CSV includes valid `bucket_name` and `extension` columns. Use `process_s3_data.py` to regenerate a clean one.
-
-**Q:** “The Sankey is all gray.”
-**A:** That’s Plotly’s default. Try toggling to ‘Dark Mode’ in your browser and pretend it’s a design choice.
 
 ## License
 
