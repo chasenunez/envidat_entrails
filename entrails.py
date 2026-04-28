@@ -1,73 +1,25 @@
 #!/usr/bin/env python3
-"""
-envidat_filetype_tool.py
+"""Crawl S3-style XML list endpoints, write file metadata to CSV, and produce
+sunburst + sankey visualizations of file-type distribution.
 
-Single-file tool to: (1) crawl S3-style XML list endpoints for EnviDat-style buckets,
-(2) compile a CSV of file metadata across buckets, and (3) visualize file-type
-distributions (sunburst + sankey) from that CSV.
-
-Usage examples (from shell):
-
-# Fetch listings for the default buckets and write to all_s3_files.csv
-python envidat_filetype_tool.py fetch --out all_s3_files.csv
-
-# Fetch listings for a custom list of buckets (comma-separated)
-python envidat_filetype_tool.py fetch --buckets https://os.zhdk.cloud.switch.ch/envicloud/,https://os.zhdk.cloud.switch.ch/chelsav1/ --out out.csv
-
-# Visualize the CSV created by the fetch step
-python envidat_filetype_tool.py visualize --csv all_s3_files.csv --out-prefix envidat_viz
-
-# Do both (fetch then visualize)
-python envidat_filetype_tool.py run-all --out all_s3_files.csv --out-prefix envidat_viz
-
-Notes:
-- Internet access is required for the `fetch` step. The `visualize` step works offline
-  from the CSV produced by `fetch`.
-- The script expects S3 ListBucketResult XML pages. It handles pagination using
-  <IsTruncated> and <NextMarker> (or last Key) as described in the S3 API.
-
-Dependencies:
-- Python 3.8+
-- requests
-- pandas
-- plotly
-
-Install dependencies with:
-pip install requests pandas plotly
-
+Run `python entrails.py --help` for CLI usage.
 """
 
 import argparse
 import csv
+import io
+import logging
 import os
 import re
-import sys
 import time
-import logging
-from typing import Optional
-import io
+import xml.etree.ElementTree as ET
 import zipfile
+from typing import Optional
 
-try:
-    import requests
-except Exception as e:
-    print("ERROR: requests is required. Install with: pip install requests")
-    raise
+import pandas as pd
+import plotly.graph_objects as go
+import requests
 
-try:
-    import pandas as pd
-except Exception as e:
-    print("ERROR: pandas is required. Install with: pip install pandas")
-    raise
-
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-except Exception as e:
-    print("ERROR: plotly is required. Install with: pip install plotly")
-    raise
-
-# ----- Configuration / defaults -----
 DEFAULT_BUCKETS = [
     "https://os.zhdk.cloud.switch.ch/envidat-doi/",
     "https://os.zhdk.cloud.switch.ch/envicloud/",
@@ -83,11 +35,9 @@ CSV_HEADERS = [
     'owner_id', 'owner_display_name', 'type'
 ]
 
-# Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 logger = logging.getLogger('envidat_tool')
 
-# ----- Helpers for XML parsing (remove namespace, robust find) -----
 
 # - need to show human readable byte amount (why can i never do this in my head?)
 def human_bytes(n):
@@ -158,7 +108,7 @@ def inspect_zip_entries_remote(bucket_root_url: str, key: str, size: int, sessio
     start = max(0, size - read_len)
     try:
         tail_bytes, status = _http_range_get(session, full_url, start, read_len)
-    except Exception as e:
+    except requests.RequestException as e:
         logger.warning("Range GET for EOCD failed for %s: %s", full_url, e)
         return entries
 
@@ -171,7 +121,7 @@ def inspect_zip_entries_remote(bucket_root_url: str, key: str, size: int, sessio
                     entries.append({'filename': zi.filename, 'compress_size': zi.compress_size,
                                     'file_size': zi.file_size, 'compress_type': zi.compress_type})
                 return entries
-            except Exception as e:
+            except zipfile.BadZipFile as e:
                 logger.warning("Full-download parsing failed for %s: %s", full_url, e)
                 return entries
         else:
@@ -199,14 +149,14 @@ def inspect_zip_entries_remote(bucket_root_url: str, key: str, size: int, sessio
         eocd = tail_bytes[idx: idx + 22]
         cd_size = _parse_le_int(eocd[12:16])
         cd_start = _parse_le_int(eocd[16:20])
-    except Exception as e:
+    except (IndexError, ValueError) as e:
         logger.warning("Failed to parse EOCD in %s: %s", full_url, e)
         return entries
 
     # 2) Fetch central directory
     try:
         cd_bytes, status2 = _http_range_get(session, full_url, cd_start, cd_size)
-    except Exception as e:
+    except requests.RequestException as e:
         logger.warning("Failed to fetch central directory for %s: %s", full_url, e)
         return entries
 
@@ -218,8 +168,8 @@ def inspect_zip_entries_remote(bucket_root_url: str, key: str, size: int, sessio
                 entries.append({'filename': zi.filename, 'compress_size': zi.compress_size,
                                 'file_size': zi.file_size, 'compress_type': zi.compress_type})
             return entries
-        except Exception:
-            pass  # fall back to the next approach
+        except zipfile.BadZipFile as e:
+            logger.debug("Full-file zip parse failed (will fall back to CD+EOCD): %s", e)
 
     # 3) Create a minimal fake zip by concatenating CD + EOCD and feed to ZipFile
     try:
@@ -231,19 +181,11 @@ def inspect_zip_entries_remote(bucket_root_url: str, key: str, size: int, sessio
             entries.append({'filename': zi.filename, 'compress_size': zi.compress_size,
                             'file_size': zi.file_size, 'compress_type': zi.compress_type})
         return entries
-    except Exception as e:
-        logger.warning("Failed to build fake zip from CD+EOCD for %s: %s", full_url, e)
+    except zipfile.BadZipFile as e:
         # Could be ZIP64 or other complicated cases; we skip in that case.
+        logger.warning("Failed to build fake zip from CD+EOCD for %s: %s", full_url, e)
         return entries
 
-
-
-
-
-
-
-
-# ----- Core: fetch/list S3-style bucket pages -----
 
 def list_s3_bucket_to_csv(bucket_url: str, csv_writer: csv.DictWriter, session: requests.Session, sleep: float = 0.0, max_pages: Optional[int] = None):
     """
@@ -267,17 +209,15 @@ def list_s3_bucket_to_csv(bucket_url: str, csv_writer: csv.DictWriter, session: 
         try:
             resp = session.get(bucket_url, params=params, timeout=60)
             resp.raise_for_status()
-        except Exception as e:
+        except requests.RequestException as e:
             logger.error('Failed to GET %s (marker=%s): %s', bucket_url, marker, e)
             raise
 
         xml_text = _strip_s3_xml_namespace(resp.text)
 
-        # Parse XML with ElementTree
         try:
-            import xml.etree.ElementTree as ET
             root = ET.fromstring(xml_text)
-        except Exception as e:
+        except ET.ParseError as e:
             logger.error('Failed to parse XML for bucket %s (marker=%s): %s', bucket_url, marker, e)
             raise
 
@@ -296,23 +236,19 @@ def list_s3_bucket_to_csv(bucket_url: str, csv_writer: csv.DictWriter, session: 
             owner_display = _safe_find_text(owner, 'DisplayName') if owner is not None else ''
             type_ = _safe_find_text(content, 'Type')
 
-            # ----- Begin filtering rules -----
-            # Normalize for case-insensitive checking
             lower_key = key.lower() if isinstance(key, str) else ''
 
-            # Rule 1: Exclude any key that contains 'envidat.1' anywhere (special DOI datasets)
+            # Rule 1: skip 'envidat.1' DOI-only datasets
             if 'envidat.1' in lower_key:
                 skipped_envidat1 += 1
                 continue
 
-            # Rule 2: For the envidat-doi bucket, exclude .html, .json, and .xml files
+            # Rule 2: skip .html/.json/.xml metadata files in the envidat-doi bucket
             if bucket_name == 'envidat-doi':
                 _, ext = os.path.splitext(key if key is not None else '')
-                ext = ext.lower()
-                if ext in ('.html', '.json', '.xml'):
+                if ext.lower() in ('.html', '.json', '.xml'):
                     skipped_doi_meta += 1
                     continue
-            # ----- End filtering rules -----
 
             csv_writer.writerow({
                 'bucket_url': bucket_url,
@@ -328,39 +264,36 @@ def list_s3_bucket_to_csv(bucket_url: str, csv_writer: csv.DictWriter, session: 
             })
 
 
-            # --- New: inspect remote ZIPs and list inner entries ---
-            # Only attempt for .zip files and when we have a valid numeric size
+            # Only attempt to inspect inner ZIP contents for .zip files with a valid numeric size
             _, ext = os.path.splitext(key if key is not None else '')
             ext = ext.lower()
             try:
                 size_int = int(size) if (size is not None and str(size).strip() != '') else None
-            except Exception:
+            except (ValueError, TypeError):
                 size_int = None
 
             if ext == '.zip' and size_int is not None and size_int > 0:
-                try:
-                    inner_entries = inspect_zip_entries_remote(bucket_url, key, size_int, session)
-                    if inner_entries:
-                        logger.info("Found %d entries inside ZIP %s", len(inner_entries), key)
-                        for ie in inner_entries:
-                            inner_key = f"{key}::{ie['filename']}"
-                            # We reuse bucket-level metadata; for size we write compressed size
-                            csv_writer.writerow({
-                                'bucket_url': bucket_url,
-                                'bucket_name': bucket_name,
-                                'key': inner_key,
-                                'last_modified': last_modified,
-                                'etag': etag,
-                                'size': str(ie.get('compress_size', '')),
-                                'storage_class': storage_class,
-                                'owner_id': owner_id,
-                                'owner_display_name': owner_display,
-                                'type': type_,
-                            })
-                    else:
-                        logger.debug("No inner entries discovered (or skipped due to complexity) for ZIP %s", key)
-                except Exception as e:
-                    logger.warning("Error while inspecting ZIP %s: %s", key, e)
+                # inspect_zip_entries_remote handles its own errors and returns [] on failure
+                inner_entries = inspect_zip_entries_remote(bucket_url, key, size_int, session)
+                if inner_entries:
+                    logger.info("Found %d entries inside ZIP %s", len(inner_entries), key)
+                    for ie in inner_entries:
+                        inner_key = f"{key}::{ie['filename']}"
+                        # We reuse bucket-level metadata; for size we write compressed size
+                        csv_writer.writerow({
+                            'bucket_url': bucket_url,
+                            'bucket_name': bucket_name,
+                            'key': inner_key,
+                            'last_modified': last_modified,
+                            'etag': etag,
+                            'size': str(ie.get('compress_size', '')),
+                            'storage_class': storage_class,
+                            'owner_id': owner_id,
+                            'owner_display_name': owner_display,
+                            'type': type_,
+                        })
+                else:
+                    logger.debug("No inner entries discovered (or skipped due to complexity) for ZIP %s", key)
 
         page_count += 1
         # Pagination control: check <IsTruncated>
@@ -400,7 +333,6 @@ def list_s3_bucket_to_csv(bucket_url: str, csv_writer: csv.DictWriter, session: 
 
     logger.info('Finished bucket: %s (pages fetched=%d)', bucket_url, page_count)
 
-# ----- Command: fetch (create the CSV) -----
 
 def cmd_fetch(buckets, out_csv, sleep_between_requests=0.0, max_pages=None):
     """Fetch listings for all given buckets and write to out_csv."""
@@ -416,8 +348,6 @@ def cmd_fetch(buckets, out_csv, sleep_between_requests=0.0, max_pages=None):
 
     logger.info('All buckets processed. CSV written to: %s', out_csv)
 
-
-# ----- Command: visualize (reads CSV and outputs visualization html files) -----
 
 def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional[int] = None):
     """Read the CSV produced by fetch and create visualizations.
@@ -440,25 +370,17 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
 
     df['extension'] = df['key'].apply(get_ext)
 
-    # Aggregate counts per bucket/extension
-    df_counts = df.groupby(['bucket_name', 'extension'], as_index=False).size().rename(columns={'size': 'count'})
-    # Pandas < 2 compatibility: if .size returns series, fix
-    if 'count' not in df_counts.columns:
-        df_counts = df.groupby(['bucket_name', 'extension']).size().reset_index(name='count')
+    df_counts = df.groupby(['bucket_name', 'extension']).size().reset_index(name='count')
 
     logger.info('Total rows (files): %d', len(df))
     logger.info('Unique (bucket, extension) rows: %d', len(df_counts))
 
-    # Optionally reduce to top N extensions overall (makes charts simpler)
     if top_n_extensions is not None:
         total_by_ext = df.groupby('extension').size().reset_index(name='total').sort_values('total', ascending=False)
         top_exts = set(total_by_ext['extension'].iloc[:top_n_extensions].tolist())
         df_counts.loc[~df_counts['extension'].isin(top_exts), 'extension'] = '<other>'
         df_counts = df_counts.groupby(['bucket_name', 'extension'], as_index=False)['count'].sum()
 
-    # ---------- Sunburst chart: bucket -> extension (use graph_objects to avoid narwhals/px backend issues) ----------
-    # Ensure df_counts is a plain pandas DataFrame and correct dtypes
-    df_counts = pd.DataFrame(df_counts)
     df_counts['count'] = df_counts['count'].astype(int)
     df_counts['bucket_name'] = df_counts['bucket_name'].astype(str)
     df_counts['extension'] = df_counts['extension'].astype(str)
@@ -505,8 +427,6 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
     sunburst_fig.write_html(sunburst_out)
     logger.info('Sunburst written to %s', sunburst_out)
 
-
-# ---------- Sankey chart: Total -> extension ----------
     total_by_extension = df.groupby('extension').size().reset_index(name='count').sort_values('count', ascending=False)
 
     labels = ['Total files'] + total_by_extension['extension'].tolist()
@@ -530,8 +450,7 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
 
     logger.info('Visualization complete.')
 
-    # ---------- Sankey chart: Total bytes -> extension ----------
-    # Ensure size column is numeric (coerce errors to 0) and use int64 for large sums
+    # Coerce size column to int64 (errors → 0) for byte-weighted charts
     df['size_bytes'] = pd.to_numeric(df.get('size', df.get('size_bytes', None)), errors='coerce').fillna(0).astype('int64')
 
     # Aggregate total bytes per extension
@@ -563,8 +482,7 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
     sankey_bytes_fig.write_html(sankey_bytes_out)
     logger.info('Sankey (by bytes) written to %s', sankey_bytes_out)
 
-    # ---------- Sunburst chart: bucket -> extension (wedge sizes = total bytes) ----------
-    # Group by (bucket_name, extension) and sum bytes
+    # Sunburst by bytes: group by (bucket_name, extension) and sum bytes
     df_counts_bytes = (
         df.groupby(['bucket_name', 'extension'], as_index=False)['size_bytes']
           .sum()
@@ -622,7 +540,6 @@ def cmd_visualize(csv_path, out_prefix='envidat_viz', top_n_extensions: Optional
     sunburst_bytes_fig.write_html(sunburst_bytes_out)
     logger.info('Sunburst (by bytes) written to %s', sunburst_bytes_out)
 
-# ----- CLI wiring -----
 
 def main(argv=None):
     p = argparse.ArgumentParser(description='EnviDat S3 listing crawler and visualizer')
