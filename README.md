@@ -2,6 +2,8 @@
 
 Crawls EnviDat's S3 buckets, builds a CSV of every file's metadata, and renders sunburst + Sankey diagrams of what's in there. The point: see at a glance which file types and which buckets are eating the storage.
 
+![entrails_description](assets/overview.png)
+
 ## What it does
 
 1. **Fetch.** Walks several S3-style listing endpoints, including peeking inside ZIP archives via HTTP range requests, and writes a unified CSV.
